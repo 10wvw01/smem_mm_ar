@@ -1,15 +1,20 @@
-// Copyright (c) 2025 Huawei Technologies Co., Ltd.
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE-CANN-2.0 in the root of the software repository for the full text of the License.
+ */
 // Adapted from CANN ops-nn v9.1.0 MatMulV3 for Ascend 310P only.
-// CANN Open Software License Agreement Version 2.0; see LICENSE-CANN-2.0.
-// AS IS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
 // smem_mm_ar310p3 on dav-m200（Ascend 310P3）: TP2 MatMul + AllReduce 通算融合算子
 //（本地归约版。研发期工程名 smem_mm_ar_inline_reduce flavor 10，收尾规整改名
 //  SmemMmAr310p3 / smem_mm_ar310p3；通信协议基于锁定版本，V2 更新 MM seat 映射）。
 //
 // 结构（一次调用 = 一批 1024 行的调度批次，rows 为 256 对齐的任意 [1024,4096]）：
 //   AIC 侧（block 0..7）：8 核纯矩阵乘座位生产——MM 结果写对称池 work 区，
-//                         尾组实属性行数不足 1024 时 pad 切片核整片跳过，
-//                         组完成通知（座位）无条件发布；
+//                         末 slab 缺席核跳过计算，仍发布 seat；
 //   AIV 侧（block 8）   ：通信调度器——逐组等本端座位齐 → 把本端组数据全量
 //                         COPY 进对端 scratch 区 → 发 8 字节就绪旗标 → 排空
 //                         本端完成通知 → 等对端旗标（对端组已落入我 scratch）；
@@ -108,8 +113,7 @@ __aicore__ inline uint32_t WaitSeats(LocalTensor<int64_t>& poll, __gm__ uint8_t*
     }
 }
 
-// 去 pad 契约：MM 组 g 的实属性行数（尾组 < 1024；rows%256 ⟹ 实属性行数为
-// 128 行切片的整数倍 ⇒ 每核切片整实或整 pad，pad 切片核可整片跳过）。
+// MM 组 g 的实际行数；尾组可能只有部分 512-row slabs。
 __aicore__ inline uint32_t RealRowsInGroup(uint32_t rows, uint32_t g)
 {
     const uint32_t lo = g * kCommRows;
@@ -175,12 +179,13 @@ extern "C" __global__ __aicore__ void smem_mm_ar310p3(GM_ADDR x, GM_ADDR w, GM_A
     TPipe pipe;
     TBuf<TPosition::VECCALC> mmBuf;
     TBuf<TPosition::VECCALC> ioBuf;
-    pipe.InitBuffer(mmBuf, TOTAL_UB_SIZE - 256);
-    pipe.InitBuffer(ioBuf, 256);
     MatmulImpl<MvA, MvB, MvC, MvBias, kCfg> mm;
     mm.SetSubBlockIdx(0);
     mm.Init(&td.mmTiling, &pipe);
+    // Match upstream init ordering, reserving only the producer mailbox.
+    pipe.InitBuffer(mmBuf, TOTAL_UB_SIZE - 256);
     mm.SetLocalWorkspace(mmBuf.Get<uint8_t>());
+    pipe.InitBuffer(ioBuf, 256);
     mm.SetOrgShape(rows, kWidth, kWidth, kWidth, kWidth);
     mm.SetHF32(false, 0);
     LocalTensor<int64_t> io = ioBuf.Get<int64_t>();

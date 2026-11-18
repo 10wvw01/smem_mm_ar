@@ -8,6 +8,7 @@ namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
   SmemMmAr310p3TilingData *tiling = context->GetTilingData<SmemMmAr310p3TilingData>();
+  if (tiling == nullptr) return ge::GRAPH_FAILED;
   const auto* attrs = context->GetAttrs();
   if (attrs == nullptr) {
     return ge::GRAPH_FAILED;

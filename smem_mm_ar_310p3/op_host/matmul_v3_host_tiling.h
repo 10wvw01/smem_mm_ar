@@ -1,7 +1,13 @@
-// Copyright (c) 2025 Huawei Technologies Co., Ltd.
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE-CANN-2.0 in the root of the software repository for the full text of the License.
+ */
 // Adapted from CANN ops-nn v9.1.0 MatMulV3 for Ascend 310P only.
-// CANN Open Software License Agreement Version 2.0; see LICENSE-CANN-2.0.
-// AS IS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
 
 #include "tiling/tiling_api.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -16,14 +22,17 @@ bool BuildMatmulV3Tiling(gert::TilingContext* context, T& td)
     auto* info = context->GetPlatformInfo();
     if (info == nullptr) return false;
     auto platform = platform_ascendc::PlatformAscendC(info);
-    uint64_t l1 = 0, l0c = 0, ub = 0;
+    uint64_t l1 = 0, l0a = 0, l0b = 0, l0c = 0, ub = 0;
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, l0a);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, l0b);
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0c);
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
     // 6*128*64*2 + 6*256*64*2 = 288 KiB L1.
     // Reserve a dedicated 256-byte ready/trace buffer on each producer.
     if (platform.GetCoreNumAic() < 8 || l1 < 294912 ||
-        l0c < 131072 || ub <= 131072 + 256) return false;
+        l0a < 32768 || l0b < 65536 || l0c < 131072 ||
+        ub <= 131072 + 256) return false;
     matmul_tiling::MultiCoreMatmulTiling mm;
     using namespace matmul_tiling;
     mm.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT16, false);

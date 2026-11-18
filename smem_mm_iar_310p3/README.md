@@ -1,5 +1,7 @@
 # smem_mm_iar_310p3 — TP2 MatMul + AllReduce 通算融合算子（硬件归约版）
 
+> **V2 研发分支说明（尚未实机验收）：** 当前计算生产者已改为 CANN 9.1.0 MatMulV3 310P 专用适配，4×2 分核，每 512 行八个 seat，尾块适配；外部接口/ND 输出与原通信传输协议不变。不抽公共代码，两包分别编译部署。下文为原部署版契约，涉及旧计算分核的描述以 [V2 设计和验收说明](../docs/V2_MATMUL_V3_310P.md) 为准。禁止 V1/V2 混跑。
+
 基于 memfabric_hybrid 的 MemFabric SDMA 对称内存池，在 Ascend C 单算子内完成
 **矩阵乘 + TP2 AllReduce**：一次调用替换 vllm-ascend 推理中 RowParallelLinear
 （o_proj / O.out）的 `MM + tensor_model_parallel_all_reduce` 两步。

@@ -16,7 +16,7 @@ steps K 3, singleCoreK 2048. Device uses MatmulImpl, GetMDLConfig(false,false,0,
 Iterate/GetTensorC, and official MTE3_MTE2 event. L2 4x2 mapping and serpentine
 N waves are specialized to 512-row readiness slabs. Actual platform UB/transLength,
 L1/L0 allocation and API ABI MUST be checked on CANN 9.1 GA; this branch is not release-ready.
-Reserve 256B UB for producer seat/trace separate from Matmul workspace.
+Reserve 256B UB for producer seat/trace separate from Matmul workspace. Match upstream Init-before-workspace ordering and check L0A/L0B double-buffer capacity. The actual runtime must confirm that the reduced UB workspace is sufficient.
 
 ## Readiness
 For slab s (512 rows, final may be 256), eight seats at ib+8192+s*512+c*64.
@@ -51,3 +51,10 @@ Do not mix V1/V2 ranks. Keep original epoch and stream discipline.
   Record per-rank p50/p95, slow-rank latency, msprof hardware timeline, Cube utilization,
   MTE/SDMA overlap, shape/packet/driver/CANN and exact git refs.
   Performance no-regression is a gate, not an assumption.
+
+## Initial static checks
+
+The two producer sections and both host helper files were compared byte-for-byte.
+The host-only schedule model passed both unittest cases, covering every supported M
+and both communication sizes. These tests do not compile Ascend C or prove SDMA
+visibility, numeric correctness, or performance.
