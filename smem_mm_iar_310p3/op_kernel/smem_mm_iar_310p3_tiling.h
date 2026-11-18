@@ -1,6 +1,7 @@
 #ifndef SMEM_MM_IAR310_P3_TILING_H
 #define SMEM_MM_IAR310_P3_TILING_H
 #include <cstdint>
+#include "kernel_tiling/kernel_tiling.h"
 
 // SmemMmIar310p3（smem_mm_iar_310p3）tiling 数据。字段顺序与 op_host TilingFunc
 // 的属性写入顺序一致；相比研发期 SmemMmArInlineReduceTilingData 删除了 flavor
@@ -20,6 +21,9 @@ struct SmemMmIar310p3TilingData {
     uint32_t commRows;
     uint32_t aicCount;
     uint32_t enabled;
+    TCubeTiling mmTiling;
+    uint32_t mmMBlock;
+    uint32_t mmNBlock;
 };
 
 #endif // SMEM_MM_IAR310_P3_TILING_H

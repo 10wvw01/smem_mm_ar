@@ -1,6 +1,7 @@
 
 #include "../op_kernel/smem_mm_iar_310p3_tiling.h"
 #include "register/op_def_registry.h"
+#include "matmul_v3_host_tiling.h"
 
 
 namespace optiling {
@@ -39,6 +40,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
       tiling->aicCount != 8) {
     return ge::GRAPH_FAILED;
   }
+  if (!BuildMatmulV3Tiling(context, *tiling)) return ge::GRAPH_FAILED;
+  context->GetRawTilingData()->SetDataSize(sizeof(*tiling));
   context->SetBlockDim(15);
   size_t *currentWorkspace = context->GetWorkspaceSizes(1);
   currentWorkspace[0] = 0;

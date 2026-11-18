@@ -1,6 +1,10 @@
+// Copyright (c) 2025 Huawei Technologies Co., Ltd.
+// Adapted from CANN ops-nn v9.1.0 MatMulV3 for Ascend 310P only.
+// CANN Open Software License Agreement Version 2.0; see LICENSE-CANN-2.0.
+// AS IS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
 // smem_mm_iar310p3 on dav-m200（Ascend 310P3）: TP2 MatMul + AllReduce 通算融合算子
 //（硬件归约版。研发期工程名 smem_mm_ar_inline_reduce flavor 11，收尾规整改名
-//  SmemMmIar310p3 / smem_mm_iar310p3；协议逻辑与本仓锁定版本逐字一致）。
+//  SmemMmIar310p3 / smem_mm_iar310p3；通信协议基于锁定版本，V2 更新 MM seat 映射）。
 //
 // 结构（一次调用 = 一批子组，子组粒度 commRows 行，rows 为 256 对齐的任意
 // [1024,4096]）：
@@ -29,7 +33,7 @@ constexpr uint32_t kCores = 8;
 constexpr uint32_t kWidth = 2048;
 constexpr uint64_t kRowBytes = kWidth * 2ULL;
 constexpr uint32_t kCommRows = 1024;
-constexpr uint32_t kMmCoreRows = kCommRows / kCores;
+constexpr uint32_t kReadyRows = 512; // physical ND readiness slab
 constexpr uint64_t kGroupBytes = kCommRows * kRowBytes;
 constexpr uint64_t kIbBytes = 8192;
 constexpr uint64_t kDataBytes = 16ULL << 20;
@@ -206,58 +210,77 @@ extern "C" __global__ __aicore__ void smem_mm_iar310p3(GM_ADDR x, GM_ADDR w, GM_
 #ifdef __DAV_CUBE__
     const uint32_t core = static_cast<uint32_t>(GetBlockIdx());
     if (core >= kCores) return;
+    // MatMulV3 v9.1.0 BaseKernel / MM_CFG_VEC_ND2NZ, specialized for
+    // this operator's fixed FP16 ND x NZ(transB) -> ND contract.
+    using namespace matmul;
     using MvA = MatmulType<TPosition::GM, CubeFormat::ND, float16_t, false>;
     using MvB = MatmulType<TPosition::GM, CubeFormat::NZ, float16_t, true>;
     using MvC = MatmulType<TPosition::GM, CubeFormat::ND, float16_t, false>;
-    using MvBias = MatmulType<TPosition::GM, CubeFormat::ND, float, false>;
-    constexpr MatmulQuantParams kQuant = {false, false};
-    constexpr MatmulBatchParams kBatch = {false, BatchMode::NONE};
-    constexpr MatmulFuncParams kFunc = {false, true, false, false, 0,
-        IterateOrder::UNDEF, ScheduleType::INNER_PRODUCT, true, true};
-    constexpr MatmulShapeParams kShape = {kMmCoreRows, kWidth, kWidth, 128, 256, 64};
-    constexpr MatmulConfig kCfg = GetMMConfig<MatmulConfigMode::CONFIG_NORM>(kShape, kQuant, kBatch, kFunc);
-    constexpr static MatmulApiStaticTiling kTiling = GetMatmulApiTiling<MvA, MvB, MvC, MvBias>(kCfg, Impl::L1_SIZE);
+    using MvBias = MatmulType<TPosition::GM, CubeFormat::ND, float16_t>;
+    constexpr static MatmulConfig kCfg = GetMDLConfig(false, false, 0, true);
+    Check(td.mmMBlock == 4 && td.mmNBlock == 2 &&
+          td.mmTiling.baseM == 128 && td.mmTiling.baseN == 256 &&
+          td.mmTiling.baseK == 64, status, 161);
     TPipe pipe;
     TBuf<TPosition::VECCALC> mmBuf;
     TBuf<TPosition::VECCALC> ioBuf;
-    constexpr uint32_t kAddElems = 8192;
-    constexpr uint32_t kAddBytes = kAddElems * 2;
-    static_assert(TOTAL_UB_SIZE > 128 * 256 * 2 * 2 + 512 + 3 * 2 * kAddBytes,
-                  "Insufficient UB for the basicM128 Matmul");
-    pipe.InitBuffer(mmBuf, TOTAL_UB_SIZE - 512 - 3 * 2 * kAddBytes);
+    pipe.InitBuffer(mmBuf, TOTAL_UB_SIZE - 256);
     pipe.InitBuffer(ioBuf, 256);
-    TCubeTiling runtime{};
-    runtime.usedCoreNum = kCores;
-    Matmul<MvA, MvB, MvC, MvBias, kTiling> mm;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &runtime);
+    MatmulImpl<MvA, MvB, MvC, MvBias, kCfg> mm;
+    mm.SetSubBlockIdx(0);
+    mm.Init(&td.mmTiling, &pipe);
     mm.SetLocalWorkspace(mmBuf.Get<uint8_t>());
+    mm.SetOrgShape(rows, kWidth, kWidth, kWidth, kWidth);
+    mm.SetHF32(false, 0);
     LocalTensor<int64_t> io = ioBuf.Get<int64_t>();
+    for (uint32_t i = 0; i < 24; ++i) io.SetValue(i, 0);
     GlobalTensor<int64_t> tg;
     tg.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(trace), kTraceU64);
-    GlobalTensor<float16_t> wg;
+    GlobalTensor<float16_t> ag, wg, cg;
+    ag.SetGlobalBuffer(reinterpret_cast<__gm__ float16_t*>(x), uint64_t{rows} * kWidth);
     wg.SetGlobalBuffer(reinterpret_cast<__gm__ float16_t*>(w), kWidth * kWidth);
-    constexpr uint32_t kSliceRows = kMmCoreRows;
-    constexpr uint64_t kSliceBytes = kSliceRows * kRowBytes;
-    for (uint32_t g = 0; g < groups; ++g) {
-        const uint64_t off = g * kGroupBytes + core * kSliceBytes;
-        // 去 pad 契约：尾组实属性行数 < 1024 时 pad 切片核跳 MM（x 无 pad 行，
-        // 读越界）；座位无条件发布（pad 座位缺席即死等）。
-        if (core * kMmCoreRows < RealRowsInGroup(rows, g)) {
-            GlobalTensor<float16_t> ag, cg;
-            ag.SetGlobalBuffer(reinterpret_cast<__gm__ float16_t*>(x + off), kSliceRows * kWidth);
-            cg.SetGlobalBuffer(reinterpret_cast<__gm__ float16_t*>(work + off), kSliceRows * kWidth);
-            mm.SetTensorA(ag, false);
-            mm.SetTensorB(wg, true);
-            mm.SetOrgShape(kSliceRows, kWidth, kWidth, kWidth, kWidth);
-            mm.IterateAll(cg);
-            Flush(work + off);
+    cg.SetGlobalBuffer(reinterpret_cast<__gm__ float16_t*>(work), uint64_t{rows} * kWidth);
+    // 4x2 L2 group. One 512-row slab is processed by all 8 producers.
+    // Each core owns one 128-row tile and every other 256-column tile.
+    // Alternate N direction between slabs, as in MatMulV3 Process().
+    const uint32_t mLane = core / td.mmNBlock;
+    const uint32_t nLane = core % td.mmNBlock;
+    const uint32_t nWaves = kWidth / (td.mmNBlock * td.mmTiling.baseN);
+    const uint32_t slabs = (rows + kReadyRows - 1) / kReadyRows;
+    for (uint32_t s = 0; s < slabs; ++s) {
+        const uint32_t m = s * kReadyRows + mLane * td.mmTiling.baseM;
+        if (m < rows) {
+            for (uint32_t j = 0; j < nWaves; ++j) {
+                const uint32_t wave = (s & 1u) ? nWaves - 1 - j : j;
+                const uint32_t n = (wave * td.mmNBlock + nLane) * td.mmTiling.baseN;
+                // Same GM offsets as MatmulBaseBlock::CalcGMOffset:
+                // A ND, B NZ with transpose, C ND (offsets in elements).
+                const uint64_t aOff = uint64_t{m} * kWidth;
+                const uint64_t bOff = uint64_t{n} * 16;
+                const uint64_t cOff = uint64_t{m} * kWidth + n;
+                mm.SetSingleShape(td.mmTiling.baseM, td.mmTiling.baseN, kWidth);
+                mm.SetTensorA(ag[aOff], false);
+                mm.SetTensorB(wg[bOff], true);
+                mm.Iterate();
+                mm.GetTensorC(cg[cOff], 0);
+                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID7);
+                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID7);
+            }
+            PipeBarrier<PIPE_ALL>();
+            Flush(work + uint64_t{m} * kRowBytes);
         }
+        // Each slab has eight seats, including empty tail producers.
+        // No consumer may read an ND slab until all eight seats match epoch.
         io.SetValue(0, static_cast<int64_t>(epoch));
         GlobalTensor<int64_t> slot;
-        slot.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(flags + uint64_t{g * kCores + core} * 64), 8);
+        slot.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(
+            flags + uint64_t{s * kCores + core} * 64), 8);
         DataCopy(slot, io, 8);
-        io.SetValue(8 + g, static_cast<int64_t>(0xA1C00000ULL | (uint64_t{core} << 8) | g));
+        PipeBarrier<PIPE_ALL>();
+        io.SetValue(8 + s, static_cast<int64_t>(0xA1C00000ULL | (uint64_t{core} << 8) | s));
     }
+    mm.End();
+    PipeBarrier<PIPE_ALL>();
     DataCopy(tg[kTraceHeader + core * kTraceCoreStride], io[8], kTraceCoreStride);
 #else
     (void)x;
@@ -283,8 +306,7 @@ extern "C" __global__ __aicore__ void smem_mm_iar310p3(GM_ADDR x, GM_ADDR w, GM_
     const uint32_t subRows = td.commRows;
     const uint64_t subBytes = uint64_t{subRows} * kRowBytes;
     const uint32_t nSub = (rows + subRows - 1) / subRows;   // 末子组可部分行
-    const uint32_t subsPerGroup = kCommRows / subRows;
-    const uint32_t slotsPerSub = kCores / subsPerGroup;
+    const uint32_t readyPerSub = subRows / kReadyRows;
     if (localIdx == 5) {
         // ------------- 完成通知消费者核（block 13）-------------
         // 排空从调度器剥离：调度器长时间泡在 signal_at 背压自旋（请求环
@@ -386,9 +408,18 @@ extern "C" __global__ __aicore__ void smem_mm_iar310p3(GM_ADDR x, GM_ADDR w, GM_
     while (cCur < nSub) {
         uint32_t did = 0;
         if (aCur < nSub) {
-            const uint32_t g = aCur / subsPerGroup;
-            const uint32_t first = (aCur % subsPerGroup) * slotsPerSub;
-            if (ProbeSeats(poll, flags, g, first, slotsPerSub, epoch) == slotsPerSub) {
+            const uint32_t first = aCur * readyPerSub;
+            const uint32_t remaining = rows - aCur * subRows;
+            const uint32_t realRows = remaining < subRows ? remaining : subRows;
+            const uint32_t nReady = (realRows + kReadyRows - 1) / kReadyRows;
+            bool localReady = true;
+            for (uint32_t s = 0; s < nReady; ++s) {
+                if (ProbeSeats(poll, flags, first + s, 0, kCores, epoch) != kCores) {
+                    localReady = false;
+                    break;
+                }
+            }
+            if (localReady) {
                 // seatUp credit 先行：座位齐即发，不等对端任何状态。
                 Check(smem_shm_sdma_signal_at(res, work + kCtrlSrcOff,
                       peer + kReadyOff + 512 + uint64_t{aCur} * 64, 8,
