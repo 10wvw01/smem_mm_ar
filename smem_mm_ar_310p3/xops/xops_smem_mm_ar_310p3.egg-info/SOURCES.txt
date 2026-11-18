@@ -1,0 +1,9 @@
+setup.py
+/home/w00804146/310P_2/prd_code/smem_mm_ar_310p3/xops/xops_ar_310p3/csrc/npu_smem_mm_ar_310p3.cpp
+/home/w00804146/310P_2/prd_code/smem_mm_ar_310p3/xops/xops_ar_310p3/csrc/ops_common.cpp
+/home/w00804146/310P_2/prd_code/smem_mm_ar_310p3/xops/xops_ar_310p3/csrc/ops_def_registration.cpp
+xops_ar_310p3/__init__.py
+xops_smem_mm_ar_310p3.egg-info/PKG-INFO
+xops_smem_mm_ar_310p3.egg-info/SOURCES.txt
+xops_smem_mm_ar_310p3.egg-info/dependency_links.txt
+xops_smem_mm_ar_310p3.egg-info/top_level.txt
